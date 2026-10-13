@@ -1,4 +1,4 @@
-name: Build and Deploy to AKS
+name: Build Push Deploy to ACI
 
 on:
   push:
@@ -14,53 +14,47 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Set up QEMU (for multi-arch, optional)
-      uses: docker/setup-qemu-action@v3
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Login to Azure CLI
+    - name: Login to Azure
       uses: azure/login@v1
       with:
-        creds: |
-          {
-            "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-            "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-            "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
-            "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
-          }
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    - name: Azure ACR login
-      run: |
-        az acr login --name ${{ secrets.ACR_NAME }}
+    - name: ACR login
+      run: az acr login -n ${{ secrets.ACR_NAME }}
 
-    - name: Build and push Docker image to ACR
-      env:
-        ACR_NAME: ${{ secrets.ACR_NAME }}
-        IMAGE_NAME: ${{ env.IMAGE_NAME }}
+    - name: Build and push image
       run: |
-        # tag: <acr-login-server>/<image>:<sha>
-        ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query "loginServer" -o tsv)
-        IMAGE_TAG=${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${GITHUB_SHA::8}
+        ACR_LOGIN=$(az acr show -n ${{ secrets.ACR_NAME }} -g ${{ secrets.AZURE_RESOURCE_GROUP }} --query loginServer -o tsv)
+        IMAGE_TAG=${ACR_LOGIN}/${{ env.IMAGE_NAME }}:${GITHUB_SHA::8}
         docker build -t $IMAGE_TAG ./app
         docker push $IMAGE_TAG
         echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-    - name: Get AKS credentials
-      run: |
-        az aks get-credentials -n ${{ secrets.AKS_NAME }} -g ${{ secrets.AZURE_RESOURCE_GROUP }} --overwrite-existing
-
-    - name: Update k8s manifest image and deploy
+    - name: Deploy to ACI (create or update)
       env:
-        IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
+        ACR_NAME: ${{ secrets.ACR_NAME }}
       run: |
-        # replace placeholder in deployment manifest and apply
-        sed -i "s|REPLACE_WITH_IMAGE|${IMAGE_TAG}|g" k8s/deployment.yaml
-        kubectl apply -f k8s/deployment.yaml
-        kubectl apply -f k8s/service.yaml
+        ACR_LOGIN=$(az acr show -n $ACR_NAME -g $RG --query loginServer -o tsv)
+        REG_USER=$(az acr credential show -n $ACR_NAME -g $RG --query "username" -o tsv)
+        REG_PASS=$(az acr credential show -n $ACR_NAME -g $RG --query "passwords[0].value" -o tsv)
 
-    - name: Wait for rollout
-      run: |
-        kubectl rollout status deployment/web-demo --timeout=120s
-        kubectl get svc web-demo-svc -o wide
+        if az container show -g $RG -n web-demo-aci &>/dev/null; then
+          az container delete -g $RG -n web-demo-aci --yes
+        fi
+
+        az container create \
+          -g $RG \
+          -n web-demo-aci \
+          --image ${{ env.IMAGE_TAG }} \
+          --dns-name-label webdemo${{ github.run_id }} \
+          --ports 80 \
+          --registry-login-server $ACR_LOGIN \
+          --registry-username $REG_USER \
+          --registry-password $REG_PASS \
+          --restart-policy Always
+
+        az container show -g $RG -n web-demo-aci --query "{FQDN:ipAddress.fqdn}" -o tsv
